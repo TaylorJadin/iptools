@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Identify common ASNs and CIDR prefixes from IP addresses found in input.
+Identify common IPs, ASNs, and CIDR prefixes from IP addresses found in input.
 
 Examples:
   ipcondense 1.1.1.1 8.8.8.8
   ipcondense ips.txt
   ipcondense 'client=192.0.2.1 peer=2001:db8::1'
   curl -s https://api.github.com/meta | ipcondense --cidr --short
+  ipcondense --ip --min-count 2 access.log
 """
 
 import argparse
@@ -110,7 +111,7 @@ def lookup_bulk(ips):
 def main():
     # type: () -> int
     parser = argparse.ArgumentParser(
-        description="Identify common ASNs and CIDR prefixes from a set of IPs.",
+        description="Identify common IPs, ASNs, and CIDR prefixes from a set of IPs.",
     )
     parser.add_argument(
         "inputs",
@@ -153,6 +154,11 @@ def main():
         help="Only output the ASN section",
     )
     parser.add_argument(
+        "--ip",
+        action="store_true",
+        help="Only output the IP address section",
+    )
+    parser.add_argument(
         "--cidr",
         action="store_true",
         help="Only output the CIDR section",
@@ -160,7 +166,7 @@ def main():
     parser.add_argument(
         "--short",
         action="store_true",
-        help="Output only the ASNs or CIDR ranges, one per line (no headers or counts)",
+        help="Output only the IPs, ASNs, or CIDR ranges, one per line (no headers or counts)",
     )
     parser.add_argument(
         "--unique",
@@ -179,9 +185,10 @@ def main():
     if not ips:
         parser.error("no IPs provided; pass IPs/files/text as arguments or pipe via stdin")
 
-    # If neither --asn nor --cidr is set, show both
-    show_asn = args.asn or not (args.asn or args.cidr)
-    show_cidr = args.cidr or not (args.asn or args.cidr)
+    # If none of the section flags are set, show all sections.
+    show_ip = args.ip or not (args.ip or args.asn or args.cidr)
+    show_asn = args.asn or not (args.ip or args.asn or args.cidr)
+    show_cidr = args.cidr or not (args.ip or args.asn or args.cidr)
 
     threshold = args.min_count
 
@@ -203,11 +210,14 @@ def main():
             items = [(k, c) for k, c in items if c >= threshold]
         return items
 
-    try:
-        results = lookup_bulk(ips)
-    except (socket.timeout, OSError) as exc:
-        print("error: lookup: {}".format(exc), file=sys.stderr)
-        return 1
+    ip_counter = Counter(ips)
+    results = []  # type: List[Tuple[str, str, str, str]]
+    if show_asn or show_cidr:
+        try:
+            results = lookup_bulk(ips)
+        except (socket.timeout, OSError) as exc:
+            print("error: lookup: {}".format(exc), file=sys.stderr)
+            return 1
 
     asn_counter = Counter((r[0], r[3]) for r in results)
     cidr_counter = Counter((r[1], r[0], r[3]) for r in results)
@@ -220,25 +230,36 @@ def main():
         scope_label += ", >={} IPs".format(threshold)
 
     if args.short:
-        if show_asn:
-            for (asn, _name), _count in filtered(asn_counter):
-                print("AS{}".format(asn))
+        if show_ip:
+            for ip, _count in filtered(ip_counter):
+                print(ip)
         if show_cidr:
             for (cidr, _asn, _name), _count in filtered(cidr_counter):
                 print(cidr)
+        if show_asn:
+            for (asn, _name), _count in filtered(asn_counter):
+                print("AS{}".format(asn))
         return 0
 
-    print("\n{} IPs total, {} resolved".format(len(ips), len(results)))
+    if show_asn or show_cidr:
+        print("\n{} IPs total, {} resolved".format(len(ips), len(results)))
+    else:
+        print("\n{} IPs total".format(len(ips)))
 
-    if show_asn:
-        print("\n=== ASNs ({}) ===".format(scope_label))
-        for (asn, name), count in filtered(asn_counter):
-            print("  {:>5}  AS{:<8}  {}".format(count, asn, name))
+    if show_ip:
+        print("\n=== IPs ({}) ===".format(scope_label))
+        for ip, count in filtered(ip_counter):
+            print("  {:>5}  {}".format(count, ip))
 
     if show_cidr:
         print("\n=== CIDR Prefixes ({}) ===".format(scope_label))
         for (cidr, asn, name), count in filtered(cidr_counter):
             print("  {:>5}  {:<20}  AS{:<8}  {}".format(count, cidr, asn, name))
+
+    if show_asn:
+        print("\n=== ASNs ({}) ===".format(scope_label))
+        for (asn, name), count in filtered(asn_counter):
+            print("  {:>5}  AS{:<8}  {}".format(count, asn, name))
 
     return 0
 
