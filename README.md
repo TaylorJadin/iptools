@@ -24,9 +24,9 @@ Run the tools directly from the repo:
 Or symlink them into `/usr/local/bin`:
 
 ```sh
-ln -s "/path/to/repo/ipinfo" /usr/local/bin/ipinfo
-ln -s "/path/to/repo/ipexpand" /usr/local/bin/ipexpand
-ln -s "/path/to/repo/ipcondense" /usr/local/bin/ipcondense
+ln -sf "/path/to/repo/ipinfo" /usr/local/bin/ipinfo
+ln -sf "/path/to/repo/ipexpand" /usr/local/bin/ipexpand
+ln -sf "/path/to/repo/ipcondense" /usr/local/bin/ipcondense
 ```
 
 ## Usage
