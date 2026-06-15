@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+
+"""
+Show ipinfo.io, BGP, and ASN details for IPs and ASNs found in input.
+
+Examples:
+  ipinfo 8.8.8.8
+  ipinfo AS15169
+  ipinfo example.com
+  ipinfo --short 'client=192.0.2.1 peer=2001:db8::1'
+  curl -s https://api.github.com/meta | ipinfo --short -4
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, List, Optional, Tuple
+
+BOLD = "\033[1m"
+FAINT = "\033[2m"
+RESET = "\033[0m"
+
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F:]+:[0-9a-fA-F:]*\b")
+ASN_RE = re.compile(r"\bAS\d+\b", re.IGNORECASE)
+INFO_URL = "https://ipinfo.io/{}/json"
+RIPESTAT_AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource={}"
+RIPESTAT_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource={}"
+ASN_DETAILS_URL = "https://asn.ipinfo.app/api/json/details/{}"
+
+
+def is_valid_ip(value):
+    # type: (str) -> bool
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def extract_ips(text):
+    # type: (str) -> List[str]
+    """Pull valid IP addresses out of an arbitrary blob of text."""
+    return [match for match in IP_RE.findall(text) if is_valid_ip(match)]
+
+
+def normalize_asn(value):
+    # type: (str) -> Optional[str]
+    """Return an AS-prefixed ASN, or None if the value is not ASN-shaped."""
+    value = value.strip()
+    if value.upper().startswith("AS"):
+        number = value[2:]
+    else:
+        number = value
+    if not number.isdigit():
+        return None
+    return "AS{}".format(int(number))
+
+
+def extract_asns(text):
+    # type: (str) -> List[str]
+    """Pull AS-prefixed ASNs out of arbitrary text."""
+    return [normalize_asn(match) for match in ASN_RE.findall(text)]
+
+
+def resolve_target(target):
+    # type: (str) -> Optional[str]
+    """Resolve a hostname to an IP address, or return None."""
+    try:
+        infos = socket.getaddrinfo(target, None)
+    except socket.gaierror:
+        return None
+
+    for info in infos:
+        ip = info[4][0]
+        if is_valid_ip(ip):
+            return ip
+    return None
+
+
+def collect_inputs(inputs):
+    # type: (List[str]) -> Tuple[List[str], List[str], List[Tuple[str, str]]]
+    """Build lists of IPs and ASNs from args, files, text, and stdin."""
+    ips = []  # type: List[str]
+    asns = []  # type: List[str]
+    resolutions = []  # type: List[Tuple[str, str]]
+
+    for item in inputs:
+        if os.path.isfile(item):
+            with open(item, "r") as handle:
+                text = handle.read()
+                ips.extend(extract_ips(text))
+                asns.extend(extract_asns(text))
+            continue
+
+        asn = normalize_asn(item)
+        if asn:
+            asns.append(asn)
+            continue
+
+        found = extract_ips(item)
+        found_asns = extract_asns(item)
+        if found or found_asns:
+            ips.extend(found)
+            asns.extend(found_asns)
+            continue
+
+        resolved = resolve_target(item)
+        if resolved:
+            ips.append(resolved)
+            resolutions.append((item, resolved))
+        else:
+            print("error: {}: could not resolve".format(item), file=sys.stderr)
+
+    if not sys.stdin.isatty():
+        text = sys.stdin.read()
+        ips.extend(extract_ips(text))
+        asns.extend(extract_asns(text))
+
+    return ips, asns, resolutions
+
+
+def filter_ips(ips, include_ipv4, include_ipv6):
+    # type: (List[str], bool, bool) -> List[str]
+    """Filter IPs by address family."""
+    filtered = []  # type: List[str]
+    for ip in ips:
+        parsed = ipaddress.ip_address(ip)
+        if isinstance(parsed, ipaddress.IPv4Address) and include_ipv4:
+            filtered.append(ip)
+        elif isinstance(parsed, ipaddress.IPv6Address) and include_ipv6:
+            filtered.append(ip)
+    return filtered
+
+
+def unique_items(items):
+    # type: (List[str]) -> List[str]
+    """Deduplicate while preserving order."""
+    seen = set()
+    unique = []  # type: List[str]
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def ipinfo_lookup(ip):
+    # type: (str) -> Dict
+    url = INFO_URL.format(urllib.parse.quote(ip))
+    req = urllib.request.Request(url, headers={"User-Agent": "ipinfo"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def json_lookup(url, user_agent):
+    # type: (str, str) -> Dict
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def cymru_lookup(ip):
+    # type: (str) -> str
+    query = " -p {}\n".format(ip)
+    with socket.create_connection(("whois.cymru.com", 43), timeout=30) as conn:
+        conn.sendall(query.encode("ascii"))
+        chunks = []  # type: List[bytes]
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    lines = b"".join(chunks).decode("utf-8", "replace").splitlines()
+    if len(lines) < 2:
+        return ""
+
+    parts = [part.strip() for part in lines[1].split("|")]
+    if len(parts) >= 3 and parts[2] != "NA":
+        return parts[2]
+    return ""
+
+
+def format_value(value):
+    # type: (object) -> str
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def format_number(value):
+    # type: (object) -> str
+    try:
+        return "{:,}".format(int(value))
+    except (TypeError, ValueError):
+        return format_value(value)
+
+
+def whois_first(records, key):
+    # type: (List[List[Dict]], str) -> str
+    key = key.lower()
+    for record in records:
+        for item in record:
+            if item.get("key", "").lower() == key:
+                return item.get("value", "")
+    return ""
+
+
+def asn_lookup(asn):
+    # type: (str) -> Dict
+    encoded = urllib.parse.quote(asn)
+    overview = json_lookup(
+        RIPESTAT_AS_OVERVIEW_URL.format(encoded),
+        "ipinfo",
+    )
+    whois = json_lookup(
+        RIPESTAT_WHOIS_URL.format(encoded),
+        "ipinfo",
+    )
+    details = json_lookup(
+        ASN_DETAILS_URL.format(encoded),
+        "ipinfo",
+    )
+    return {
+        "overview": overview.get("data", {}),
+        "whois": whois.get("data", {}),
+        "details": details,
+    }
+
+
+def print_info(ip, colors):
+    # type: (str, Dict[str, str]) -> None
+    bold, reset = colors["bold"], colors["reset"]
+    data = ipinfo_lookup(ip)
+    for key in sorted(data.keys()):
+        value = data[key]
+        if "missingauth" in format_value(value):
+            continue
+        print("{}{}:{} {}".format(bold, key, reset, format_value(value)))
+
+    print("{}range:{} {}".format(bold, reset, cymru_lookup(ip)))
+    print("{}more:{} https://ipinfo.io/{}".format(bold, reset, ip))
+    print("")
+
+
+def print_asn_info(asn, colors):
+    # type: (str, Dict[str, str]) -> None
+    bold, reset = colors["bold"], colors["reset"]
+    data = asn_lookup(asn)
+    overview = data["overview"]
+    whois = data["whois"]
+    details = data["details"]
+    records = whois.get("records", [])
+
+    fields = [
+        ("asn", asn),
+        ("name", details.get("name") or whois_first(records, "as-name") or overview.get("holder")),
+        ("description", whois_first(records, "descr")),
+        ("registry", whois_first(records, "source") or ", ".join(whois.get("authorities", []))),
+        ("status", whois_first(records, "status")),
+        ("announced", overview.get("announced")),
+        ("prefixes", details.get("iprec")),
+        ("ipv4 addresses", details.get("v4size")),
+        ("ipv6 /64s", details.get("v6size")),
+    ]
+
+    for key, value in fields:
+        if value in (None, ""):
+            continue
+        if key in ("prefixes", "ipv4 addresses", "ipv6 /64s"):
+            value = format_number(value)
+        print("{}{}:{} {}".format(bold, key, reset, value))
+
+    print("{}more:{} https://ipinfo.io/{}".format(bold, reset, asn))
+    print("")
+
+
+def main():
+    # type: () -> int
+    parser = argparse.ArgumentParser(
+        description="Show ipinfo.io, BGP, and ASN details for IPs and ASNs found in input.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        help="IP addresses, ASNs, hostnames, file paths, or arbitrary text containing IPs/ASNs",
+    )
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "--short",
+        action="store_true",
+        help="Only output discovered IPs and ASNs, one per line",
+    )
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="Deduplicate discovered IPs and ASNs before output or lookup",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored output",
+    )
+    args = parser.parse_args()
+
+    include_ipv4 = args.ipv4 or not (args.ipv4 or args.ipv6)
+    include_ipv6 = args.ipv6 or not (args.ipv4 or args.ipv6)
+
+    ips, asns, resolutions = collect_inputs(args.inputs)
+    ips = filter_ips(ips, include_ipv4, include_ipv6)
+    if args.unique:
+        ips = unique_items(ips)
+        asns = unique_items(asns)
+    if not ips and not asns:
+        parser.error("no IPs or ASNs provided; pass inputs/files/text as arguments or pipe via stdin")
+
+    if args.short:
+        for ip in ips:
+            print(ip)
+        for asn in asns:
+            print(asn)
+        return 0
+
+    use_color = sys.stdout.isatty() and not args.no_color
+    colors = {
+        "bold": BOLD if use_color else "",
+        "faint": FAINT if use_color else "",
+        "reset": RESET if use_color else "",
+    }
+    exit_code = 0
+    for ip in ips:
+        for source, resolved in resolutions:
+            if resolved == ip:
+                print("{}{} -> {}{}".format(colors["faint"], source, ip, colors["reset"]))
+                break
+        try:
+            print_info(ip, colors)
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
+            print("error: {}: {}".format(ip, exc), file=sys.stderr)
+            exit_code = 1
+    for asn in asns:
+        try:
+            print_asn_info(asn, colors)
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
+            print("error: {}: {}".format(asn, exc), file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

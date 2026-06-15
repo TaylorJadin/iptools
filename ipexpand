@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+"""
+Expand CIDRs, ASNs, and IPs found in input into individual IP addresses.
+
+Examples:
+  ipexpand 192.0.2.0/24
+  ipexpand 2001:db8::/120
+  ipexpand AS15169                 # defaults to both IPv4 and IPv6
+  ipexpand -4 AS15169              # IPv4 only
+  ipexpand -6 AS15169              # IPv6 only
+  ipexpand -4 -6 AS15169           # both (same as default)
+
+  ipexpand 'ranges: 192.0.2.0/30 and 2001:db8::/126'
+  curl -s https://api.github.com/meta | ipexpand -4
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import List, Optional, Union
+
+RIPESTAT_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource={}"
+TARGET_RE = re.compile(
+    r"\bAS\d+\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+    r"\b[0-9a-fA-F:]+:[0-9a-fA-F:]*/\d{1,3}\b|"
+    r"\b[0-9a-fA-F:]+:[0-9a-fA-F:]*\b"
+)
+
+Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+
+def asn_prefixes(asn):
+    # type: (str) -> List[str]
+    """Fetch announced prefixes for an ASN from RIPEstat."""
+    asn = asn.upper().lstrip("AS")
+    if not asn.isdigit():
+        raise ValueError("Invalid ASN: {}".format(asn))
+
+    url = RIPESTAT_URL.format(urllib.parse.quote("AS{}".format(asn)))
+    req = urllib.request.Request(url, headers={"User-Agent": "ipexpand"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.load(resp)
+
+    return [p["prefix"] for p in payload["data"]["prefixes"]]
+
+
+def classify_prefix(prefix):
+    # type: (str) -> Optional[Network]
+    """Return an ip_network for the prefix, or None if invalid."""
+    try:
+        return ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return None
+
+
+def clean_target(raw):
+    # type: (str) -> str
+    """Strip whitespace, surrounding quotes, and trailing commas from an input line."""
+    s = raw.strip()
+    # Strip trailing commas (common when piping from JSON arrays line-by-line).
+    s = s.rstrip(",").strip()
+    # Strip matching surrounding quotes (single or double).
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
+def extract_targets(text):
+    # type: (str) -> List[str]
+    """Pull ASNs, CIDRs, and bare IPs out of arbitrary text."""
+    targets = []  # type: List[str]
+    for match in TARGET_RE.findall(text):
+        target = clean_target(match)
+        if not target:
+            continue
+        if target.upper().startswith("AS"):
+            targets.append(target)
+            continue
+        try:
+            if "/" in target:
+                ipaddress.ip_network(target, strict=False)
+            else:
+                ipaddress.ip_address(target)
+            targets.append(target)
+        except ValueError:
+            continue
+    return targets
+
+
+def collect_inputs(inputs):
+    # type: (List[str]) -> List[str]
+    """Build targets from args, files, arbitrary text, and stdin."""
+    targets = []  # type: List[str]
+    for item in inputs:
+        if os.path.isfile(item):
+            with open(item, "r") as handle:
+                targets.extend(extract_targets(handle.read()))
+            continue
+
+        extracted = extract_targets(item)
+        if extracted:
+            targets.extend(extracted)
+            continue
+
+        cleaned = clean_target(item)
+        if cleaned:
+            targets.append(cleaned)
+
+    if not sys.stdin.isatty():
+        targets.extend(extract_targets(sys.stdin.read()))
+
+    return targets
+
+
+def emit_network(net, include_all):
+    # type: (Network, bool) -> None
+    """Print every address in a network, honoring the include_all flag for IPv4."""
+    if include_all:
+        iterator = net
+    elif isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+        iterator = net.hosts()
+    else:
+        iterator = net
+    for ip in iterator:
+        print(ip)
+
+
+def expand_target(target, include_ipv4, include_ipv6, include_all):
+    # type: (str, bool, bool, bool) -> None
+    """Expand a single CIDR, ASN, or IP target to stdout."""
+    # Heuristic: anything containing "/" is treated as CIDR; otherwise ASN.
+    if "/" in target:
+        net = ipaddress.ip_network(target, strict=False)
+        if isinstance(net, ipaddress.IPv4Network) and not include_ipv4:
+            return
+        if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
+            return
+        emit_network(net, include_all)
+        return
+
+    try:
+        ip = ipaddress.ip_address(target)
+        if isinstance(ip, ipaddress.IPv4Address) and include_ipv4:
+            print(ip)
+        elif isinstance(ip, ipaddress.IPv6Address) and include_ipv6:
+            print(ip)
+        return
+    except ValueError:
+        pass
+
+    for prefix in asn_prefixes(target):
+        net = classify_prefix(prefix)
+        if net is None:
+            print("error: {}: invalid prefix".format(prefix), file=sys.stderr)
+            continue
+        if isinstance(net, ipaddress.IPv4Network) and not include_ipv4:
+            continue
+        if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
+            continue
+        emit_network(net, include_all)
+
+
+def main():
+    # type: () -> int
+    parser = argparse.ArgumentParser(
+        description="Expand CIDRs, ASNs, and IPs found in input into individual IP addresses.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        help="CIDRs, ASNs, IPs, file paths, or arbitrary text containing targets",
+    )
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include network/broadcast addresses for IPv4 CIDRs.",
+    )
+    args = parser.parse_args()
+
+    # If neither -4 nor -6 is passed, include both (default behavior).
+    include_ipv4 = args.ipv4 or not (args.ipv4 or args.ipv6)
+    include_ipv6 = args.ipv6 or not (args.ipv4 or args.ipv6)
+
+    targets = collect_inputs(args.inputs)
+    if not targets:
+        parser.error("no targets provided; pass targets/files/text as arguments or pipe via stdin")
+
+    exit_code = 0
+    for target in targets:
+        try:
+            expand_target(
+                target,
+                include_ipv4=include_ipv4,
+                include_ipv6=include_ipv6,
+                include_all=args.all,
+            )
+        except (ValueError, urllib.error.URLError, KeyError) as exc:
+            print("error: {}: {}".format(target, exc), file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
