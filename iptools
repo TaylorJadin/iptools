@@ -79,9 +79,9 @@ def filter_ips(ips, include_ipv4, include_ipv6):
     filtered = []  # type: List[str]
     for ip in ips:
         parsed = ipaddress.ip_address(ip)
-        if isinstance(parsed, ipaddress.IPv4Address) and include_ipv4:
+        if parsed.version == 4 and include_ipv4:
             filtered.append(ip)
-        elif isinstance(parsed, ipaddress.IPv6Address) and include_ipv6:
+        elif parsed.version == 6 and include_ipv6:
             filtered.append(ip)
     return filtered
 
@@ -102,16 +102,43 @@ def unique_items(items):
 def include_families(ipv4, ipv6):
     # type: (bool, bool) -> Tuple[bool, bool]
     """Default to both families unless one or both explicit flags are passed."""
-    include_ipv4 = ipv4 or not (ipv4 or ipv6)
-    include_ipv6 = ipv6 or not (ipv4 or ipv6)
-    return include_ipv4, include_ipv6
+    return ipv4 or not ipv6, ipv6 or not ipv4
 
 
-def json_lookup(url, user_agent):
-    # type: (str, str) -> Dict
+def json_lookup(url):
+    # type: (str) -> Dict
+    """Fetch a JSON API response using the tool's shared HTTP settings."""
+    user_agent = "iptools"
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def add_family_flags(parser):
+    # type: (argparse.ArgumentParser) -> None
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+
+
+def stdin_text():
+    # type: () -> str
+    if sys.stdin.isatty():
+        return ""
+    return sys.stdin.read()
+
+
+def read_text_file(path):
+    # type: (str) -> str
+    with open(path, "r") as handle:
+        return handle.read()
 
 
 def normalize_asn(value):
@@ -130,7 +157,12 @@ def normalize_asn(value):
 def extract_asns(text):
     # type: (str) -> List[str]
     """Pull AS-prefixed ASNs out of arbitrary text."""
-    return [normalize_asn(match) for match in ASN_RE.findall(text)]
+    asns = []  # type: List[str]
+    for match in ASN_RE.findall(text):
+        asn = normalize_asn(match)
+        if asn:
+            asns.append(asn)
+    return asns
 
 
 def resolve_target(target):
@@ -157,10 +189,9 @@ def collect_info_inputs(inputs):
 
     for item in inputs:
         if os.path.isfile(item):
-            with open(item, "r") as handle:
-                text = handle.read()
-                ips.extend(extract_ips(text))
-                asns.extend(extract_asns(text))
+            text = read_text_file(item)
+            ips.extend(extract_ips(text))
+            asns.extend(extract_asns(text))
             continue
 
         asn = normalize_asn(item)
@@ -182,8 +213,8 @@ def collect_info_inputs(inputs):
         else:
             print("error: {}: could not resolve".format(item), file=sys.stderr)
 
-    if not sys.stdin.isatty():
-        text = sys.stdin.read()
+    text = stdin_text()
+    if text:
         ips.extend(extract_ips(text))
         asns.extend(extract_asns(text))
 
@@ -193,7 +224,7 @@ def collect_info_inputs(inputs):
 def ipinfo_lookup(ip):
     # type: (str) -> Dict
     url = INFO_URL.format(urllib.parse.quote(ip))
-    return json_lookup(url, "iptools")
+    return json_lookup(url)
 
 
 def cymru_lookup(ip):
@@ -246,9 +277,9 @@ def whois_first(records, key):
 def asn_lookup(asn):
     # type: (str) -> Dict
     encoded = urllib.parse.quote(asn)
-    overview = json_lookup(RIPESTAT_AS_OVERVIEW_URL.format(encoded), "iptools")
-    whois = json_lookup(RIPESTAT_WHOIS_URL.format(encoded), "iptools")
-    details = json_lookup(ASN_DETAILS_URL.format(encoded), "iptools")
+    overview = json_lookup(RIPESTAT_AS_OVERVIEW_URL.format(encoded))
+    whois = json_lookup(RIPESTAT_WHOIS_URL.format(encoded))
+    details = json_lookup(ASN_DETAILS_URL.format(encoded))
     return {
         "overview": overview.get("data", {}),
         "whois": whois.get("data", {}),
@@ -391,10 +422,7 @@ def asn_prefixes(asn):
         raise ValueError("Invalid ASN: {}".format(asn))
 
     url = RIPESTAT_PREFIXES_URL.format(urllib.parse.quote("AS{}".format(asn)))
-    req = urllib.request.Request(url, headers={"User-Agent": "iptools"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.load(resp)
-
+    payload = json_lookup(url)
     return [p["prefix"] for p in payload["data"]["prefixes"]]
 
 
@@ -445,8 +473,7 @@ def collect_expand_inputs(inputs):
     targets = []  # type: List[str]
     for item in inputs:
         if os.path.isfile(item):
-            with open(item, "r") as handle:
-                targets.extend(extract_targets(handle.read()))
+            targets.extend(extract_targets(read_text_file(item)))
             continue
 
         extracted = extract_targets(item)
@@ -458,8 +485,9 @@ def collect_expand_inputs(inputs):
         if cleaned:
             targets.append(cleaned)
 
-    if not sys.stdin.isatty():
-        targets.extend(extract_targets(sys.stdin.read()))
+    text = stdin_text()
+    if text:
+        targets.extend(extract_targets(text))
 
     return targets
 
@@ -522,16 +550,7 @@ def run_expand(argv):
         nargs="*",
         help="CIDRs, ASNs, IPs, file paths, or arbitrary text containing targets",
     )
-    parser.add_argument(
-        "-4", "--ipv4",
-        action="store_true",
-        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
-    )
-    parser.add_argument(
-        "-6", "--ipv6",
-        action="store_true",
-        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
-    )
+    add_family_flags(parser)
     parser.add_argument(
         "--all",
         action="store_true",
@@ -566,14 +585,14 @@ def collect_condense_inputs(inputs):
 
     for item in inputs:
         if os.path.isfile(item):
-            with open(item, "r") as handle:
-                ips.extend(extract_ips(handle.read()))
+            ips.extend(extract_ips(read_text_file(item)))
             continue
 
         ips.extend(extract_ips(item))
 
-    if not sys.stdin.isatty():
-        ips.extend(extract_ips(sys.stdin.read()))
+    text = stdin_text()
+    if text:
+        ips.extend(extract_ips(text))
 
     return ips
 
@@ -596,11 +615,29 @@ def lookup_bulk(ips):
     for line in data.decode().splitlines()[1:]:
         parts = [p.strip() for p in line.split("|")]
         if len(parts) >= 7:
-            asn, ip, prefix, cc, _, _, name = parts[:7]
+            asn, _ip, prefix, cc, _, _, name = parts[:7]
             if asn == "NA" or prefix == "NA":
                 continue
             results.append((asn, prefix, cc, name))
     return results
+
+
+def selected_sections(args):
+    # type: (argparse.Namespace) -> Tuple[bool, bool, bool]
+    """Return whether to show IP, ASN, and CIDR sections."""
+    show_all = not (args.ip or args.asn or args.cidr)
+    return args.ip or show_all, args.asn or show_all, args.cidr or show_all
+
+
+def output_limit(show_all, top, min_count):
+    # type: (bool, Optional[int], int) -> Optional[int]
+    if show_all:
+        return None
+    if top is not None:
+        return top
+    if min_count > 0:
+        return None
+    return 10
 
 
 def run_condense(argv):
@@ -614,16 +651,7 @@ def run_condense(argv):
         nargs="*",
         help="IP addresses, file paths, or arbitrary text containing IPs",
     )
-    parser.add_argument(
-        "-4", "--ipv4",
-        action="store_true",
-        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
-    )
-    parser.add_argument(
-        "-6", "--ipv6",
-        action="store_true",
-        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
-    )
+    add_family_flags(parser)
     parser.add_argument(
         "-n", "--top",
         type=int,
@@ -679,19 +707,10 @@ def run_condense(argv):
     if not ips:
         parser.error("no IPs provided; pass IPs/files/text as arguments or pipe via stdin")
 
-    show_ip = args.ip or not (args.ip or args.asn or args.cidr)
-    show_asn = args.asn or not (args.ip or args.asn or args.cidr)
-    show_cidr = args.cidr or not (args.ip or args.asn or args.cidr)
+    show_ip, show_asn, show_cidr = selected_sections(args)
 
     threshold = args.min_count
-    if args.all:
-        limit = None
-    elif args.top is not None:
-        limit = args.top
-    elif threshold > 0:
-        limit = None
-    else:
-        limit = 10
+    limit = output_limit(args.all, args.top, threshold)
 
     def filtered(counter):
         items = counter.most_common(None if limit is None else limit)
