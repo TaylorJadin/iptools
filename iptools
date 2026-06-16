@@ -38,6 +38,10 @@ TARGET_RE = re.compile(
 )
 
 INFO_URL = "https://ipinfo.io/{}/json"
+PUBLIC_IP_URLS = (
+    "https://api.ipify.org",
+    "https://api64.ipify.org",
+)
 RIPESTAT_AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource={}"
 RIPESTAT_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource={}"
 ASN_DETAILS_URL = "https://asn.ipinfo.app/api/json/details/{}"
@@ -103,6 +107,236 @@ def include_families(ipv4, ipv6):
     # type: (bool, bool) -> Tuple[bool, bool]
     """Default to both families unless one or both explicit flags are passed."""
     return ipv4 or not ipv6, ipv6 or not ipv4
+
+
+def default_config_paths():
+    # type: () -> List[str]
+    """Return config files to load, from bundled defaults to user overrides."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    xdg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    paths = [
+        os.path.join(script_dir, "iptools.conf"),
+        os.path.join(xdg_home, "iptools", "config"),
+    ]
+    env_path = os.environ.get("IPTOOLS_CONFIG")
+    if env_path:
+        paths.append(os.path.expanduser(env_path))
+    return paths
+
+
+def parse_bool(value):
+    # type: (str) -> Optional[bool]
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def read_config_file(path):
+    # type: (str) -> Dict[str, object]
+    config = {
+        "skip_public_ip": None,
+        "skip_local_ips": None,
+        "skip_targets": [],
+    }  # type: Dict[str, object]
+    section = "options"
+    with open(path, "r") as handle:
+        for number, raw_line in enumerate(handle, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip().lower()
+                continue
+
+            if section == "skip":
+                config["skip_targets"].append(line)  # type: ignore[attr-defined]
+                continue
+
+            if "=" not in line:
+                print("warning: {}:{}: ignoring invalid config line".format(path, number), file=sys.stderr)
+                continue
+            key, value = [part.strip() for part in line.split("=", 1)]
+            key = key.lower().replace("-", "_")
+            if key in ("skip_public_ip", "skip_local_ips"):
+                parsed = parse_bool(value)
+                if parsed is None:
+                    print("warning: {}:{}: invalid boolean: {}".format(path, number, value), file=sys.stderr)
+                    continue
+                config[key] = parsed
+            else:
+                print("warning: {}:{}: unknown config option: {}".format(path, number, key), file=sys.stderr)
+    return config
+
+
+def load_config(paths=None):
+    # type: (Optional[List[str]]) -> Dict[str, object]
+    config = {
+        "skip_public_ip": False,
+        "skip_local_ips": False,
+        "skip_targets": [],
+    }  # type: Dict[str, object]
+    for path in paths or default_config_paths():
+        if not path or not os.path.isfile(path):
+            continue
+        loaded = read_config_file(path)
+        if loaded["skip_public_ip"] is not None:
+            config["skip_public_ip"] = loaded["skip_public_ip"]
+        if loaded["skip_local_ips"] is not None:
+            config["skip_local_ips"] = loaded["skip_local_ips"]
+        config["skip_targets"].extend(loaded["skip_targets"])  # type: ignore[attr-defined]
+    return config
+
+
+def public_ips():
+    # type: () -> List[str]
+    ips = []  # type: List[str]
+    for url in PUBLIC_IP_URLS:
+        try:
+            data = urllib.request.urlopen(url, timeout=10).read().decode("utf-8").strip()
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError):
+            continue
+        if is_valid_ip(data):
+            ips.append(data)
+    return unique_items(ips)
+
+
+def local_ips():
+    # type: () -> List[str]
+    ips = []  # type: List[str]
+    names = unique_items([socket.gethostname(), socket.getfqdn()])
+    for name in names:
+        try:
+            infos = socket.getaddrinfo(name, None)
+        except socket.gaierror:
+            continue
+        for info in infos:
+            ip = info[4][0]
+            if "%" in ip:
+                ip = ip.split("%", 1)[0]
+            if is_valid_ip(ip):
+                ips.append(ip)
+
+    probes = [
+        (socket.AF_INET, ("8.8.8.8", 80)),
+        (socket.AF_INET6, ("2001:4860:4860::8888", 80)),
+    ]
+    for family, address in probes:
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect(address)
+                ip = sock.getsockname()[0]
+        except OSError:
+            continue
+        if is_valid_ip(ip):
+            ips.append(ip)
+    return unique_items(ips)
+
+
+def skip_rules(config):
+    # type: (Dict[str, object]) -> Dict[str, object]
+    rules = {
+        "ips": set(),
+        "networks": [],
+        "asns": set(),
+    }  # type: Dict[str, object]
+
+    targets = list(config.get("skip_targets", []))  # type: List[str]
+    if config.get("skip_public_ip"):
+        targets.extend(public_ips())
+    if config.get("skip_local_ips"):
+        targets.extend(local_ips())
+
+    for target in targets:
+        value = clean_target(str(target))
+        if not value:
+            continue
+        asn = normalize_asn(value)
+        if asn:
+            rules["asns"].add(asn)  # type: ignore[attr-defined]
+            continue
+        try:
+            if "/" in value:
+                rules["networks"].append(ipaddress.ip_network(value, strict=False))  # type: ignore[attr-defined]
+            else:
+                rules["ips"].add(ipaddress.ip_address(value))  # type: ignore[attr-defined]
+        except ValueError:
+            print("warning: ignoring invalid skip target: {}".format(value), file=sys.stderr)
+    return rules
+
+
+def ip_is_skipped(ip, rules):
+    # type: (str, Dict[str, object]) -> bool
+    parsed = ipaddress.ip_address(ip)
+    if parsed in rules["ips"]:
+        return True
+    return any(parsed in network for network in rules["networks"])
+
+
+def asn_is_skipped(asn, rules):
+    # type: (str, Dict[str, object]) -> bool
+    normalized = normalize_asn(asn)
+    return normalized in rules["asns"] if normalized else False
+
+
+def network_is_skipped(prefix, rules):
+    # type: (str, Dict[str, object]) -> bool
+    net = ipaddress.ip_network(prefix, strict=False)
+    for skipped in rules["networks"]:
+        if net.version == skipped.version and net.overlaps(skipped):
+            return True
+    return False
+
+
+def info_asns(data):
+    # type: (Dict) -> List[str]
+    """Extract ASNs from an IP lookup payload."""
+    return unique_items(extract_asns(json.dumps(data, sort_keys=True)))
+
+
+def lookup_info_is_skipped(data, bgp_range, rules):
+    # type: (Dict, str, Dict[str, object]) -> bool
+    if any(asn_is_skipped(asn, rules) for asn in info_asns(data)):
+        return True
+    if bgp_range:
+        try:
+            return network_is_skipped(bgp_range, rules)
+        except ValueError:
+            return False
+    return False
+
+
+def has_lookup_skip_rules(rules):
+    # type: (Dict[str, object]) -> bool
+    return bool(rules["networks"] or rules["asns"])
+
+
+def lookup_result_is_skipped(result, rules):
+    # type: (Tuple[str, str, str, str, str], Dict[str, object]) -> bool
+    _ip, asn, prefix, _cc, _name = result
+    if asn_is_skipped(asn, rules):
+        return True
+    try:
+        return network_is_skipped(prefix, rules)
+    except ValueError:
+        return False
+
+
+def has_skip_rules(rules):
+    # type: (Dict[str, object]) -> bool
+    return bool(rules["ips"] or rules["networks"] or rules["asns"])
+
+
+def filter_skipped_ips(ips, rules):
+    # type: (List[str], Dict[str, object]) -> List[str]
+    return [ip for ip in ips if not ip_is_skipped(ip, rules)]
+
+
+def filter_skipped_asns(asns, rules):
+    # type: (List[str], Dict[str, object]) -> List[str]
+    return [asn for asn in asns if not asn_is_skipped(asn, rules)]
 
 
 def json_lookup(url):
@@ -287,17 +521,20 @@ def asn_lookup(asn):
     }
 
 
-def print_info(ip, colors):
-    # type: (str, Dict[str, str]) -> None
+def print_info(ip, colors, data=None, bgp_range=None):
+    # type: (str, Dict[str, str], Optional[Dict], Optional[str]) -> None
     bold, reset = colors["bold"], colors["reset"]
-    data = ipinfo_lookup(ip)
+    if data is None:
+        data = ipinfo_lookup(ip)
+    if bgp_range is None:
+        bgp_range = cymru_lookup(ip)
     for key in sorted(data.keys()):
         value = data[key]
         if "missingauth" in format_value(value):
             continue
         print("{}{}:{} {}".format(bold, key, reset, format_value(value)))
 
-    print("{}range:{} {}".format(bold, reset, cymru_lookup(ip)))
+    print("{}range:{} {}".format(bold, reset, bgp_range))
     print("{}more:{} https://ipinfo.io/{}".format(bold, reset, ip))
     print("")
 
@@ -334,8 +571,8 @@ def print_asn_info(asn, colors):
     print("")
 
 
-def run_info(argv):
-    # type: (List[str]) -> int
+def run_info(argv, config):
+    # type: (List[str], Dict[str, object]) -> int
     parser = argparse.ArgumentParser(
         prog="iptools info",
         description="Show ipinfo.io, BGP, and ASN details for IPs and ASNs found in input.",
@@ -373,12 +610,19 @@ def run_info(argv):
     args = parser.parse_args(argv)
 
     include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    rules = skip_rules(config)
     ips, asns, resolutions = collect_info_inputs(args.inputs)
     ips = filter_ips(ips, include_ipv4, include_ipv6)
+    found_count = len(ips) + len(asns)
+    ips = filter_skipped_ips(ips, rules)
+    asns = filter_skipped_asns(asns, rules)
     if args.unique:
         ips = unique_items(ips)
         asns = unique_items(asns)
     if not ips and not asns:
+        if found_count and has_skip_rules(rules):
+            print("all IPs and ASNs were skipped")
+            return 0
         parser.error("no IPs or ASNs provided; pass inputs/files/text as arguments or pipe via stdin")
 
     if args.short:
@@ -395,22 +639,33 @@ def run_info(argv):
         "reset": RESET if use_color else "",
     }
     exit_code = 0
+    output_count = 0
+    lookup_skipped_count = 0
     for ip in ips:
-        for source, resolved in resolutions:
-            if resolved == ip:
-                print("{}{} -> {}{}".format(colors["faint"], source, ip, colors["reset"]))
-                break
         try:
-            print_info(ip, colors)
+            data = ipinfo_lookup(ip)
+            bgp_range = cymru_lookup(ip)
+            if lookup_info_is_skipped(data, bgp_range, rules):
+                lookup_skipped_count += 1
+                continue
+            for source, resolved in resolutions:
+                if resolved == ip:
+                    print("{}{} -> {}{}".format(colors["faint"], source, ip, colors["reset"]))
+                    break
+            print_info(ip, colors, data=data, bgp_range=bgp_range)
+            output_count += 1
         except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
             print("error: {}: {}".format(ip, exc), file=sys.stderr)
             exit_code = 1
     for asn in asns:
         try:
             print_asn_info(asn, colors)
+            output_count += 1
         except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
             print("error: {}: {}".format(asn, exc), file=sys.stderr)
             exit_code = 1
+    if output_count == 0 and lookup_skipped_count > 0 and exit_code == 0:
+        print("all IPs and ASNs were skipped")
     return exit_code
 
 
@@ -492,9 +747,11 @@ def collect_expand_inputs(inputs):
     return targets
 
 
-def emit_network(net, include_all):
-    # type: (Network, bool) -> None
+def emit_network(net, include_all, rules):
+    # type: (Network, bool, Dict[str, object]) -> Tuple[int, int]
     """Print every address in a network, honoring the include_all flag for IPv4."""
+    emitted = 0
+    skipped = 0
     if include_all:
         iterator = net
     elif isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
@@ -502,31 +759,43 @@ def emit_network(net, include_all):
     else:
         iterator = net
     for ip in iterator:
+        if ip_is_skipped(str(ip), rules):
+            skipped += 1
+            continue
         print(ip)
+        emitted += 1
+    return emitted, skipped
 
 
-def expand_target(target, include_ipv4, include_ipv6, include_all):
-    # type: (str, bool, bool, bool) -> None
+def expand_target(target, include_ipv4, include_ipv6, include_all, rules):
+    # type: (str, bool, bool, bool, Dict[str, object]) -> Tuple[int, int]
     """Expand a single CIDR, ASN, or IP target to stdout."""
     if "/" in target:
         net = ipaddress.ip_network(target, strict=False)
         if isinstance(net, ipaddress.IPv4Network) and not include_ipv4:
-            return
+            return 0, 0
         if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
-            return
-        emit_network(net, include_all)
-        return
+            return 0, 0
+        return emit_network(net, include_all, rules)
 
     try:
         ip = ipaddress.ip_address(target)
+        if ip_is_skipped(str(ip), rules):
+            return 0, 1
         if isinstance(ip, ipaddress.IPv4Address) and include_ipv4:
             print(ip)
+            return 1, 0
         elif isinstance(ip, ipaddress.IPv6Address) and include_ipv6:
             print(ip)
-        return
+            return 1, 0
+        return 0, 0
     except ValueError:
         pass
 
+    if asn_is_skipped(target, rules):
+        return 0, 1
+    emitted = 0
+    skipped = 0
     for prefix in asn_prefixes(target):
         net = classify_prefix(prefix)
         if net is None:
@@ -536,11 +805,14 @@ def expand_target(target, include_ipv4, include_ipv6, include_all):
             continue
         if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
             continue
-        emit_network(net, include_all)
+        net_emitted, net_skipped = emit_network(net, include_all, rules)
+        emitted += net_emitted
+        skipped += net_skipped
+    return emitted, skipped
 
 
-def run_expand(argv):
-    # type: (List[str]) -> int
+def run_expand(argv, config):
+    # type: (List[str], Dict[str, object]) -> int
     parser = argparse.ArgumentParser(
         prog="iptools expand",
         description="Expand CIDRs, ASNs, and IPs found in input into individual IP addresses.",
@@ -559,22 +831,30 @@ def run_expand(argv):
     args = parser.parse_args(argv)
 
     include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    rules = skip_rules(config)
     targets = collect_expand_inputs(args.inputs)
     if not targets:
         parser.error("no targets provided; pass targets/files/text as arguments or pipe via stdin")
 
     exit_code = 0
+    emitted_count = 0
+    skipped_count = 0
     for target in targets:
         try:
-            expand_target(
+            emitted, skipped = expand_target(
                 target,
                 include_ipv4=include_ipv4,
                 include_ipv6=include_ipv6,
                 include_all=args.all,
+                rules=rules,
             )
+            emitted_count += emitted
+            skipped_count += skipped
         except (ValueError, urllib.error.URLError, KeyError) as exc:
             print("error: {}: {}".format(target, exc), file=sys.stderr)
             exit_code = 1
+    if emitted_count == 0 and skipped_count > 0 and exit_code == 0:
+        print("all IPs were skipped")
     return exit_code
 
 
@@ -598,7 +878,7 @@ def collect_condense_inputs(inputs):
 
 
 def lookup_bulk(ips):
-    # type: (List[str]) -> List[Tuple[str, str, str, str]]
+    # type: (List[str]) -> List[Tuple[str, str, str, str, str]]
     """Query Team Cymru bulk WHOIS."""
     query = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
     with socket.create_connection(("whois.cymru.com", 43), timeout=30) as s:
@@ -611,14 +891,14 @@ def lookup_bulk(ips):
             chunks.append(chunk)
         data = b"".join(chunks)
 
-    results = []  # type: List[Tuple[str, str, str, str]]
+    results = []  # type: List[Tuple[str, str, str, str, str]]
     for line in data.decode().splitlines()[1:]:
         parts = [p.strip() for p in line.split("|")]
         if len(parts) >= 7:
             asn, _ip, prefix, cc, _, _, name = parts[:7]
             if asn == "NA" or prefix == "NA":
                 continue
-            results.append((asn, prefix, cc, name))
+            results.append((_ip, asn, prefix, cc, name))
     return results
 
 
@@ -640,8 +920,18 @@ def output_limit(show_all, top, min_count):
     return 10
 
 
-def run_condense(argv):
-    # type: (List[str]) -> int
+def print_condense_summary(total, resolved, skipped, show_resolved):
+    # type: (int, int, int, bool) -> None
+    parts = ["{} IPs total".format(total)]
+    if show_resolved:
+        parts.append("{} resolved".format(resolved))
+    if skipped:
+        parts.append("{} skipped".format(skipped))
+    print("\n{}".format(", ".join(parts)))
+
+
+def run_condense(argv, config):
+    # type: (List[str], Dict[str, object]) -> int
     parser = argparse.ArgumentParser(
         prog="iptools condense",
         description="Identify common IPs, ASNs, and CIDR prefixes from a set of IPs.",
@@ -700,11 +990,18 @@ def run_condense(argv):
     args = parser.parse_args(argv)
 
     include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    rules = skip_rules(config)
     ips = collect_condense_inputs(args.inputs)
     ips = filter_ips(ips, include_ipv4, include_ipv6)
+    found_count = len(ips)
+    ips = filter_skipped_ips(ips, rules)
+    skipped_count = found_count - len(ips)
     if args.unique:
         ips = unique_items(ips)
     if not ips:
+        if found_count and has_skip_rules(rules):
+            print("all IPs were skipped")
+            return 0
         parser.error("no IPs provided; pass IPs/files/text as arguments or pipe via stdin")
 
     show_ip, show_asn, show_cidr = selected_sections(args)
@@ -718,17 +1015,32 @@ def run_condense(argv):
             items = [(k, c) for k, c in items if c >= threshold]
         return items
 
-    ip_counter = Counter(ips)
-    results = []  # type: List[Tuple[str, str, str, str]]
-    if show_asn or show_cidr:
+    results = []  # type: List[Tuple[str, str, str, str, str]]
+    lookup_skipped_count = 0
+    needs_lookup = show_asn or show_cidr or (show_ip and has_lookup_skip_rules(rules))
+    if needs_lookup:
         try:
-            results = lookup_bulk(ips)
+            lookup_results = lookup_bulk(ips)
         except (socket.timeout, OSError) as exc:
             print("error: lookup: {}".format(exc), file=sys.stderr)
             return 1
+        results = [r for r in lookup_results if not lookup_result_is_skipped(r, rules)]
+        lookup_skipped_count = len(lookup_results) - len(results)
+        skipped_lookup_ips = set(r[0] for r in lookup_results if lookup_result_is_skipped(r, rules))
+        if skipped_lookup_ips:
+            before_lookup_skip_count = len(ips)
+            ips = [ip for ip in ips if ip not in skipped_lookup_ips]
+            skipped_count += before_lookup_skip_count - len(ips)
+            if not ips:
+                print("all IPs were skipped")
+                return 0
+        if not show_ip and lookup_skipped_count and not results:
+            print("all lookup results were skipped")
+            return 0
 
-    asn_counter = Counter((r[0], r[3]) for r in results)
-    cidr_counter = Counter((r[1], r[0], r[3]) for r in results)
+    ip_counter = Counter(ips)
+    asn_counter = Counter((r[1], r[4]) for r in results)
+    cidr_counter = Counter((r[2], r[1], r[4]) for r in results)
 
     if limit is None:
         scope_label = "all"
@@ -749,10 +1061,12 @@ def run_condense(argv):
                 print("AS{}".format(asn))
         return 0
 
-    if show_asn or show_cidr:
-        print("\n{} IPs total, {} resolved".format(len(ips), len(results)))
-    else:
-        print("\n{} IPs total".format(len(ips)))
+    print_condense_summary(
+        total=len(ips) + skipped_count,
+        resolved=len(results),
+        skipped=skipped_count,
+        show_resolved=show_asn or show_cidr,
+    )
 
     if show_ip:
         print("\n=== IPs ({}) ===".format(scope_label))
@@ -774,31 +1088,86 @@ def run_condense(argv):
 
 def print_help():
     # type: () -> None
-    print("usage: iptools <command> [options] [inputs...]")
+    print("usage: iptools [global options] <command> [options] [inputs...]")
     print("")
     print("Commands:")
     width = max(len(command) for command in COMMANDS)
     for command in sorted(COMMANDS):
         print("  {:{}}  {}".format(command, width, COMMANDS[command]))
     print("")
+    print("Global options:")
+    print("  --config PATH  Load this config file after the default config locations.")
+    print("  --skip VALUE   Skip this IP, CIDR, or ASN for this run. Repeat as needed.")
+    print("  --no-skip      Disable all configured and command-line skips for this run.")
+    print("")
     print("Run 'iptools <command> --help' for command-specific options.")
+
+
+def split_global_args(argv):
+    # type: (List[str]) -> Tuple[Optional[str], List[str], bool, List[str]]
+    config_path = None  # type: Optional[str]
+    skip_targets = []  # type: List[str]
+    no_skip = False
+    remaining = []  # type: List[str]
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--config":
+            if index + 1 >= len(argv):
+                parser = argparse.ArgumentParser(prog="iptools", add_help=False)
+                parser.error("--config requires a path")
+            config_path = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg == "--skip":
+            if index + 1 >= len(argv):
+                parser = argparse.ArgumentParser(prog="iptools", add_help=False)
+                parser.error("--skip requires an IP, CIDR, or ASN")
+            skip_targets.append(argv[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--skip="):
+            skip_targets.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if arg == "--no-skip":
+            no_skip = True
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+    return config_path, skip_targets, no_skip, remaining
 
 
 def main(argv=None):
     # type: (Optional[List[str]]) -> int
     argv = sys.argv[1:] if argv is None else argv
+    config_path, cli_skip_targets, no_skip, argv = split_global_args(argv)
     if not argv or argv[0] in ("-h", "--help"):
         print_help()
         return 0
+    if no_skip:
+        config = {
+            "skip_public_ip": False,
+            "skip_local_ips": False,
+            "skip_targets": [],
+        }  # type: Dict[str, object]
+    else:
+        config = load_config(default_config_paths() + ([config_path] if config_path else []))
+        config["skip_targets"].extend(cli_skip_targets)  # type: ignore[attr-defined]
 
     command = ALIASES.get(argv[0], argv[0])
     command_args = argv[1:]
     if command == "info":
-        return run_info(command_args)
+        return run_info(command_args, config)
     if command == "expand":
-        return run_expand(command_args)
+        return run_expand(command_args, config)
     if command == "condense":
-        return run_condense(command_args)
+        return run_condense(command_args, config)
 
     parser = argparse.ArgumentParser(prog="iptools", add_help=False)
     parser.error("unknown command: {}".format(argv[0]))

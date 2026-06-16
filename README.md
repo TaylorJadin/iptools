@@ -27,6 +27,46 @@ Or symlink it into `/usr/local/bin`:
 ln -sf "/path/to/repo/iptools" /usr/local/bin/iptools
 ```
 
+## Config
+
+`iptools` loads config from `iptools.conf` next to the real script location,
+`~/.config/iptools/config`, `$IPTOOLS_CONFIG`, and any file passed with
+`--config PATH`. If `iptools` is symlinked into a directory such as
+`/usr/local/bin`, the executable-local config is still read from the symlink
+target directory. Later files override boolean options. Skip entries are
+cumulative.
+
+```conf
+skip_public_ip = false
+skip_local_ips = false
+
+[skip]
+203.0.113.10
+198.51.100.0/24
+2001:db8::/32
+AS64500
+```
+
+`skip_public_ip` skips the device's public IP address. `skip_local_ips` skips
+the device's local IP addresses.
+
+For one-off runs, pass `--skip VALUE` with an IP address, CIDR range, or ASN.
+Repeat it to skip multiple values. Pass `--no-skip` to ignore all configured
+and command-line skips for that run.
+
+```sh
+iptools --skip 203.0.113.10 expand 203.0.113.0/30
+iptools condense --skip 198.51.100.0/24 access.log
+iptools --no-skip info 203.0.113.10
+```
+
+Skip rules also apply to lookup-derived output where possible. For example, an
+IP returned by `iptools info` is skipped when its lookup data belongs to a
+skipped ASN, and `iptools condense` omits IP, CIDR, and ASN output discovered
+from skipped Team Cymru lookup results.
+When `condense` prints a summary, skipped IPs are included in the total and
+reported separately.
+
 ## Usage
 
 Show details for an IP, ASN, or hostname:
