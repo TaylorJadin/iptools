@@ -66,6 +66,8 @@ skipped ASN, and `iptools condense` omits IP, CIDR, and ASN output discovered
 from skipped Team Cymru lookup results.
 When `condense` prints a summary, skipped IPs are included in the total and
 reported separately.
+Non-short `condense` IP output includes ASN and ASN name details when lookup
+data is available.
 
 ## Usage
 

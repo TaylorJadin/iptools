@@ -1017,7 +1017,7 @@ def run_condense(argv, config):
 
     results = []  # type: List[Tuple[str, str, str, str, str]]
     lookup_skipped_count = 0
-    needs_lookup = show_asn or show_cidr or (show_ip and has_lookup_skip_rules(rules))
+    needs_lookup = show_asn or show_cidr or (show_ip and (not args.short or has_lookup_skip_rules(rules)))
     if needs_lookup:
         try:
             lookup_results = lookup_bulk(ips)
@@ -1039,6 +1039,9 @@ def run_condense(argv, config):
             return 0
 
     ip_counter = Counter(ips)
+    ip_lookup_details = {}  # type: Dict[str, Tuple[str, str]]
+    for ip, asn, _prefix, _cc, name in results:
+        ip_lookup_details[ip] = (asn, name)
     asn_counter = Counter((r[1], r[4]) for r in results)
     cidr_counter = Counter((r[2], r[1], r[4]) for r in results)
 
@@ -1065,13 +1068,18 @@ def run_condense(argv, config):
         total=len(ips) + skipped_count,
         resolved=len(results),
         skipped=skipped_count,
-        show_resolved=show_asn or show_cidr,
+        show_resolved=needs_lookup,
     )
 
     if show_ip:
         print("\n=== IPs ({}) ===".format(scope_label))
         for ip, count in filtered(ip_counter):
-            print("  {:>5}  {}".format(count, ip))
+            details = ip_lookup_details.get(ip)
+            if details:
+                asn, name = details
+                print("  {:>5}  {:<20}  AS{:<8}  {}".format(count, ip, asn, name))
+            else:
+                print("  {:>5}  {}".format(count, ip))
 
     if show_cidr:
         print("\n=== CIDR Prefixes ({}) ===".format(scope_label))
