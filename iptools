@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+
+"""
+Unified command-line tool for extracting, expanding, and summarizing IP
+addresses, CIDR ranges, and ASNs from arguments, files, or stdin.
+
+Examples:
+  iptools info 8.8.8.8
+  iptools expand 192.0.2.0/30
+  iptools condense --cidr --short access.log
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from typing import Dict, List, Optional, Tuple, Union
+
+BOLD = "\033[1m"
+FAINT = "\033[2m"
+RESET = "\033[0m"
+
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F:]+:[0-9a-fA-F:]*\b")
+ASN_RE = re.compile(r"\bAS\d+\b", re.IGNORECASE)
+TARGET_RE = re.compile(
+    r"\bAS\d+\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+    r"\b[0-9a-fA-F:]+:[0-9a-fA-F:]*/\d{1,3}\b|"
+    r"\b[0-9a-fA-F:]+:[0-9a-fA-F:]*\b"
+)
+
+INFO_URL = "https://ipinfo.io/{}/json"
+RIPESTAT_AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?resource={}"
+RIPESTAT_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource={}"
+ASN_DETAILS_URL = "https://asn.ipinfo.app/api/json/details/{}"
+RIPESTAT_PREFIXES_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource={}"
+
+Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+COMMANDS = {
+    "info": "Show IP, BGP, ASN, and hostname lookup details.",
+    "expand": "Expand CIDRs, ASNs, and IPs into individual IP addresses.",
+    "condense": "Identify common IPs, ASNs, and CIDR prefixes.",
+}
+
+ALIASES = {
+    "ipinfo": "info",
+    "ipexpand": "expand",
+    "ipcondense": "condense",
+}
+
+
+def is_valid_ip(value):
+    # type: (str) -> bool
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def extract_ips(text):
+    # type: (str) -> List[str]
+    """Pull valid IP addresses out of an arbitrary blob of text."""
+    return [match for match in IP_RE.findall(text) if is_valid_ip(match)]
+
+
+def filter_ips(ips, include_ipv4, include_ipv6):
+    # type: (List[str], bool, bool) -> List[str]
+    """Filter IPs by address family."""
+    filtered = []  # type: List[str]
+    for ip in ips:
+        parsed = ipaddress.ip_address(ip)
+        if isinstance(parsed, ipaddress.IPv4Address) and include_ipv4:
+            filtered.append(ip)
+        elif isinstance(parsed, ipaddress.IPv6Address) and include_ipv6:
+            filtered.append(ip)
+    return filtered
+
+
+def unique_items(items):
+    # type: (List[str]) -> List[str]
+    """Deduplicate while preserving order."""
+    seen = set()
+    unique = []  # type: List[str]
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def include_families(ipv4, ipv6):
+    # type: (bool, bool) -> Tuple[bool, bool]
+    """Default to both families unless one or both explicit flags are passed."""
+    include_ipv4 = ipv4 or not (ipv4 or ipv6)
+    include_ipv6 = ipv6 or not (ipv4 or ipv6)
+    return include_ipv4, include_ipv6
+
+
+def json_lookup(url, user_agent):
+    # type: (str, str) -> Dict
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def normalize_asn(value):
+    # type: (str) -> Optional[str]
+    """Return an AS-prefixed ASN, or None if the value is not ASN-shaped."""
+    value = value.strip()
+    if value.upper().startswith("AS"):
+        number = value[2:]
+    else:
+        number = value
+    if not number.isdigit():
+        return None
+    return "AS{}".format(int(number))
+
+
+def extract_asns(text):
+    # type: (str) -> List[str]
+    """Pull AS-prefixed ASNs out of arbitrary text."""
+    return [normalize_asn(match) for match in ASN_RE.findall(text)]
+
+
+def resolve_target(target):
+    # type: (str) -> Optional[str]
+    """Resolve a hostname to an IP address, or return None."""
+    try:
+        infos = socket.getaddrinfo(target, None)
+    except socket.gaierror:
+        return None
+
+    for info in infos:
+        ip = info[4][0]
+        if is_valid_ip(ip):
+            return ip
+    return None
+
+
+def collect_info_inputs(inputs):
+    # type: (List[str]) -> Tuple[List[str], List[str], List[Tuple[str, str]]]
+    """Build lists of IPs and ASNs from args, files, text, and stdin."""
+    ips = []  # type: List[str]
+    asns = []  # type: List[str]
+    resolutions = []  # type: List[Tuple[str, str]]
+
+    for item in inputs:
+        if os.path.isfile(item):
+            with open(item, "r") as handle:
+                text = handle.read()
+                ips.extend(extract_ips(text))
+                asns.extend(extract_asns(text))
+            continue
+
+        asn = normalize_asn(item)
+        if asn:
+            asns.append(asn)
+            continue
+
+        found = extract_ips(item)
+        found_asns = extract_asns(item)
+        if found or found_asns:
+            ips.extend(found)
+            asns.extend(found_asns)
+            continue
+
+        resolved = resolve_target(item)
+        if resolved:
+            ips.append(resolved)
+            resolutions.append((item, resolved))
+        else:
+            print("error: {}: could not resolve".format(item), file=sys.stderr)
+
+    if not sys.stdin.isatty():
+        text = sys.stdin.read()
+        ips.extend(extract_ips(text))
+        asns.extend(extract_asns(text))
+
+    return ips, asns, resolutions
+
+
+def ipinfo_lookup(ip):
+    # type: (str) -> Dict
+    url = INFO_URL.format(urllib.parse.quote(ip))
+    return json_lookup(url, "iptools")
+
+
+def cymru_lookup(ip):
+    # type: (str) -> str
+    query = " -p {}\n".format(ip)
+    with socket.create_connection(("whois.cymru.com", 43), timeout=30) as conn:
+        conn.sendall(query.encode("ascii"))
+        chunks = []  # type: List[bytes]
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    lines = b"".join(chunks).decode("utf-8", "replace").splitlines()
+    if len(lines) < 2:
+        return ""
+
+    parts = [part.strip() for part in lines[1].split("|")]
+    if len(parts) >= 3 and parts[2] != "NA":
+        return parts[2]
+    return ""
+
+
+def format_value(value):
+    # type: (object) -> str
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def format_number(value):
+    # type: (object) -> str
+    try:
+        return "{:,}".format(int(value))
+    except (TypeError, ValueError):
+        return format_value(value)
+
+
+def whois_first(records, key):
+    # type: (List[List[Dict]], str) -> str
+    key = key.lower()
+    for record in records:
+        for item in record:
+            if item.get("key", "").lower() == key:
+                return item.get("value", "")
+    return ""
+
+
+def asn_lookup(asn):
+    # type: (str) -> Dict
+    encoded = urllib.parse.quote(asn)
+    overview = json_lookup(RIPESTAT_AS_OVERVIEW_URL.format(encoded), "iptools")
+    whois = json_lookup(RIPESTAT_WHOIS_URL.format(encoded), "iptools")
+    details = json_lookup(ASN_DETAILS_URL.format(encoded), "iptools")
+    return {
+        "overview": overview.get("data", {}),
+        "whois": whois.get("data", {}),
+        "details": details,
+    }
+
+
+def print_info(ip, colors):
+    # type: (str, Dict[str, str]) -> None
+    bold, reset = colors["bold"], colors["reset"]
+    data = ipinfo_lookup(ip)
+    for key in sorted(data.keys()):
+        value = data[key]
+        if "missingauth" in format_value(value):
+            continue
+        print("{}{}:{} {}".format(bold, key, reset, format_value(value)))
+
+    print("{}range:{} {}".format(bold, reset, cymru_lookup(ip)))
+    print("{}more:{} https://ipinfo.io/{}".format(bold, reset, ip))
+    print("")
+
+
+def print_asn_info(asn, colors):
+    # type: (str, Dict[str, str]) -> None
+    bold, reset = colors["bold"], colors["reset"]
+    data = asn_lookup(asn)
+    overview = data["overview"]
+    whois = data["whois"]
+    details = data["details"]
+    records = whois.get("records", [])
+
+    fields = [
+        ("asn", asn),
+        ("name", details.get("name") or whois_first(records, "as-name") or overview.get("holder")),
+        ("description", whois_first(records, "descr")),
+        ("registry", whois_first(records, "source") or ", ".join(whois.get("authorities", []))),
+        ("status", whois_first(records, "status")),
+        ("announced", overview.get("announced")),
+        ("prefixes", details.get("iprec")),
+        ("ipv4 addresses", details.get("v4size")),
+        ("ipv6 /64s", details.get("v6size")),
+    ]
+
+    for key, value in fields:
+        if value in (None, ""):
+            continue
+        if key in ("prefixes", "ipv4 addresses", "ipv6 /64s"):
+            value = format_number(value)
+        print("{}{}:{} {}".format(bold, key, reset, value))
+
+    print("{}more:{} https://ipinfo.io/{}".format(bold, reset, asn))
+    print("")
+
+
+def run_info(argv):
+    # type: (List[str]) -> int
+    parser = argparse.ArgumentParser(
+        prog="iptools info",
+        description="Show ipinfo.io, BGP, and ASN details for IPs and ASNs found in input.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        help="IP addresses, ASNs, hostnames, file paths, or arbitrary text containing IPs/ASNs",
+    )
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "--short",
+        action="store_true",
+        help="Only output discovered IPs and ASNs, one per line",
+    )
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="Deduplicate discovered IPs and ASNs before output or lookup",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored output",
+    )
+    args = parser.parse_args(argv)
+
+    include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    ips, asns, resolutions = collect_info_inputs(args.inputs)
+    ips = filter_ips(ips, include_ipv4, include_ipv6)
+    if args.unique:
+        ips = unique_items(ips)
+        asns = unique_items(asns)
+    if not ips and not asns:
+        parser.error("no IPs or ASNs provided; pass inputs/files/text as arguments or pipe via stdin")
+
+    if args.short:
+        for ip in ips:
+            print(ip)
+        for asn in asns:
+            print(asn)
+        return 0
+
+    use_color = sys.stdout.isatty() and not args.no_color
+    colors = {
+        "bold": BOLD if use_color else "",
+        "faint": FAINT if use_color else "",
+        "reset": RESET if use_color else "",
+    }
+    exit_code = 0
+    for ip in ips:
+        for source, resolved in resolutions:
+            if resolved == ip:
+                print("{}{} -> {}{}".format(colors["faint"], source, ip, colors["reset"]))
+                break
+        try:
+            print_info(ip, colors)
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
+            print("error: {}: {}".format(ip, exc), file=sys.stderr)
+            exit_code = 1
+    for asn in asns:
+        try:
+            print_asn_info(asn, colors)
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
+            print("error: {}: {}".format(asn, exc), file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+def asn_prefixes(asn):
+    # type: (str) -> List[str]
+    """Fetch announced prefixes for an ASN from RIPEstat."""
+    asn = asn.upper().lstrip("AS")
+    if not asn.isdigit():
+        raise ValueError("Invalid ASN: {}".format(asn))
+
+    url = RIPESTAT_PREFIXES_URL.format(urllib.parse.quote("AS{}".format(asn)))
+    req = urllib.request.Request(url, headers={"User-Agent": "iptools"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.load(resp)
+
+    return [p["prefix"] for p in payload["data"]["prefixes"]]
+
+
+def classify_prefix(prefix):
+    # type: (str) -> Optional[Network]
+    """Return an ip_network for the prefix, or None if invalid."""
+    try:
+        return ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return None
+
+
+def clean_target(raw):
+    # type: (str) -> str
+    """Strip whitespace, surrounding quotes, and trailing commas from an input line."""
+    s = raw.strip()
+    s = s.rstrip(",").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
+def extract_targets(text):
+    # type: (str) -> List[str]
+    """Pull ASNs, CIDRs, and bare IPs out of arbitrary text."""
+    targets = []  # type: List[str]
+    for match in TARGET_RE.findall(text):
+        target = clean_target(match)
+        if not target:
+            continue
+        if target.upper().startswith("AS"):
+            targets.append(target)
+            continue
+        try:
+            if "/" in target:
+                ipaddress.ip_network(target, strict=False)
+            else:
+                ipaddress.ip_address(target)
+            targets.append(target)
+        except ValueError:
+            continue
+    return targets
+
+
+def collect_expand_inputs(inputs):
+    # type: (List[str]) -> List[str]
+    """Build targets from args, files, arbitrary text, and stdin."""
+    targets = []  # type: List[str]
+    for item in inputs:
+        if os.path.isfile(item):
+            with open(item, "r") as handle:
+                targets.extend(extract_targets(handle.read()))
+            continue
+
+        extracted = extract_targets(item)
+        if extracted:
+            targets.extend(extracted)
+            continue
+
+        cleaned = clean_target(item)
+        if cleaned:
+            targets.append(cleaned)
+
+    if not sys.stdin.isatty():
+        targets.extend(extract_targets(sys.stdin.read()))
+
+    return targets
+
+
+def emit_network(net, include_all):
+    # type: (Network, bool) -> None
+    """Print every address in a network, honoring the include_all flag for IPv4."""
+    if include_all:
+        iterator = net
+    elif isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+        iterator = net.hosts()
+    else:
+        iterator = net
+    for ip in iterator:
+        print(ip)
+
+
+def expand_target(target, include_ipv4, include_ipv6, include_all):
+    # type: (str, bool, bool, bool) -> None
+    """Expand a single CIDR, ASN, or IP target to stdout."""
+    if "/" in target:
+        net = ipaddress.ip_network(target, strict=False)
+        if isinstance(net, ipaddress.IPv4Network) and not include_ipv4:
+            return
+        if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
+            return
+        emit_network(net, include_all)
+        return
+
+    try:
+        ip = ipaddress.ip_address(target)
+        if isinstance(ip, ipaddress.IPv4Address) and include_ipv4:
+            print(ip)
+        elif isinstance(ip, ipaddress.IPv6Address) and include_ipv6:
+            print(ip)
+        return
+    except ValueError:
+        pass
+
+    for prefix in asn_prefixes(target):
+        net = classify_prefix(prefix)
+        if net is None:
+            print("error: {}: invalid prefix".format(prefix), file=sys.stderr)
+            continue
+        if isinstance(net, ipaddress.IPv4Network) and not include_ipv4:
+            continue
+        if isinstance(net, ipaddress.IPv6Network) and not include_ipv6:
+            continue
+        emit_network(net, include_all)
+
+
+def run_expand(argv):
+    # type: (List[str]) -> int
+    parser = argparse.ArgumentParser(
+        prog="iptools expand",
+        description="Expand CIDRs, ASNs, and IPs found in input into individual IP addresses.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        help="CIDRs, ASNs, IPs, file paths, or arbitrary text containing targets",
+    )
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include network/broadcast addresses for IPv4 CIDRs.",
+    )
+    args = parser.parse_args(argv)
+
+    include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    targets = collect_expand_inputs(args.inputs)
+    if not targets:
+        parser.error("no targets provided; pass targets/files/text as arguments or pipe via stdin")
+
+    exit_code = 0
+    for target in targets:
+        try:
+            expand_target(
+                target,
+                include_ipv4=include_ipv4,
+                include_ipv6=include_ipv6,
+                include_all=args.all,
+            )
+        except (ValueError, urllib.error.URLError, KeyError) as exc:
+            print("error: {}: {}".format(target, exc), file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+def collect_condense_inputs(inputs):
+    # type: (List[str]) -> List[str]
+    """Build a list of IPs from args, files, arbitrary text, and stdin."""
+    ips = []  # type: List[str]
+
+    for item in inputs:
+        if os.path.isfile(item):
+            with open(item, "r") as handle:
+                ips.extend(extract_ips(handle.read()))
+            continue
+
+        ips.extend(extract_ips(item))
+
+    if not sys.stdin.isatty():
+        ips.extend(extract_ips(sys.stdin.read()))
+
+    return ips
+
+
+def lookup_bulk(ips):
+    # type: (List[str]) -> List[Tuple[str, str, str, str]]
+    """Query Team Cymru bulk WHOIS."""
+    query = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
+    with socket.create_connection(("whois.cymru.com", 43), timeout=30) as s:
+        s.sendall(query.encode())
+        chunks = []  # type: List[bytes]
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+
+    results = []  # type: List[Tuple[str, str, str, str]]
+    for line in data.decode().splitlines()[1:]:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 7:
+            asn, ip, prefix, cc, _, _, name = parts[:7]
+            if asn == "NA" or prefix == "NA":
+                continue
+            results.append((asn, prefix, cc, name))
+    return results
+
+
+def run_condense(argv):
+    # type: (List[str]) -> int
+    parser = argparse.ArgumentParser(
+        prog="iptools condense",
+        description="Identify common IPs, ASNs, and CIDR prefixes from a set of IPs.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        help="IP addresses, file paths, or arbitrary text containing IPs",
+    )
+    parser.add_argument(
+        "-4", "--ipv4",
+        action="store_true",
+        help="Include IPv4 addresses. Combine with -6 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        action="store_true",
+        help="Include IPv6 addresses. Combine with -4 (or omit both) for all.",
+    )
+    parser.add_argument(
+        "-n", "--top",
+        type=int,
+        default=None,
+        help="Show top N entries (default: 10, "
+             "or all when --min-count is used without -n)",
+    )
+    parser.add_argument(
+        "-a", "--all",
+        action="store_true",
+        help="Show all entries (overrides --top)",
+    )
+    parser.add_argument(
+        "-m", "--min-count",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Only show entries with at least N IPs "
+             "(implies --all unless -n is also given)",
+    )
+    parser.add_argument(
+        "--asn",
+        action="store_true",
+        help="Only output the ASN section",
+    )
+    parser.add_argument(
+        "--ip",
+        action="store_true",
+        help="Only output the IP address section",
+    )
+    parser.add_argument(
+        "--cidr",
+        action="store_true",
+        help="Only output the CIDR section",
+    )
+    parser.add_argument(
+        "--short",
+        action="store_true",
+        help="Output only the IPs, ASNs, or CIDR ranges, one per line (no headers or counts)",
+    )
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="Deduplicate discovered IPs before lookup",
+    )
+    args = parser.parse_args(argv)
+
+    include_ipv4, include_ipv6 = include_families(args.ipv4, args.ipv6)
+    ips = collect_condense_inputs(args.inputs)
+    ips = filter_ips(ips, include_ipv4, include_ipv6)
+    if args.unique:
+        ips = unique_items(ips)
+    if not ips:
+        parser.error("no IPs provided; pass IPs/files/text as arguments or pipe via stdin")
+
+    show_ip = args.ip or not (args.ip or args.asn or args.cidr)
+    show_asn = args.asn or not (args.ip or args.asn or args.cidr)
+    show_cidr = args.cidr or not (args.ip or args.asn or args.cidr)
+
+    threshold = args.min_count
+    if args.all:
+        limit = None
+    elif args.top is not None:
+        limit = args.top
+    elif threshold > 0:
+        limit = None
+    else:
+        limit = 10
+
+    def filtered(counter):
+        items = counter.most_common(None if limit is None else limit)
+        if threshold > 0:
+            items = [(k, c) for k, c in items if c >= threshold]
+        return items
+
+    ip_counter = Counter(ips)
+    results = []  # type: List[Tuple[str, str, str, str]]
+    if show_asn or show_cidr:
+        try:
+            results = lookup_bulk(ips)
+        except (socket.timeout, OSError) as exc:
+            print("error: lookup: {}".format(exc), file=sys.stderr)
+            return 1
+
+    asn_counter = Counter((r[0], r[3]) for r in results)
+    cidr_counter = Counter((r[1], r[0], r[3]) for r in results)
+
+    if limit is None:
+        scope_label = "all"
+    else:
+        scope_label = "top {}".format(limit)
+    if threshold > 0:
+        scope_label += ", >={} IPs".format(threshold)
+
+    if args.short:
+        if show_ip:
+            for ip, _count in filtered(ip_counter):
+                print(ip)
+        if show_cidr:
+            for (cidr, _asn, _name), _count in filtered(cidr_counter):
+                print(cidr)
+        if show_asn:
+            for (asn, _name), _count in filtered(asn_counter):
+                print("AS{}".format(asn))
+        return 0
+
+    if show_asn or show_cidr:
+        print("\n{} IPs total, {} resolved".format(len(ips), len(results)))
+    else:
+        print("\n{} IPs total".format(len(ips)))
+
+    if show_ip:
+        print("\n=== IPs ({}) ===".format(scope_label))
+        for ip, count in filtered(ip_counter):
+            print("  {:>5}  {}".format(count, ip))
+
+    if show_cidr:
+        print("\n=== CIDR Prefixes ({}) ===".format(scope_label))
+        for (cidr, asn, name), count in filtered(cidr_counter):
+            print("  {:>5}  {:<20}  AS{:<8}  {}".format(count, cidr, asn, name))
+
+    if show_asn:
+        print("\n=== ASNs ({}) ===".format(scope_label))
+        for (asn, name), count in filtered(asn_counter):
+            print("  {:>5}  AS{:<8}  {}".format(count, asn, name))
+
+    return 0
+
+
+def print_help():
+    # type: () -> None
+    print("usage: iptools <command> [options] [inputs...]")
+    print("")
+    print("Commands:")
+    width = max(len(command) for command in COMMANDS)
+    for command in sorted(COMMANDS):
+        print("  {:{}}  {}".format(command, width, COMMANDS[command]))
+    print("")
+    print("Run 'iptools <command> --help' for command-specific options.")
+
+
+def main(argv=None):
+    # type: (Optional[List[str]]) -> int
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] in ("-h", "--help"):
+        print_help()
+        return 0
+
+    command = ALIASES.get(argv[0], argv[0])
+    command_args = argv[1:]
+    if command == "info":
+        return run_info(command_args)
+    if command == "expand":
+        return run_expand(command_args)
+    if command == "condense":
+        return run_condense(command_args)
+
+    parser = argparse.ArgumentParser(prog="iptools", add_help=False)
+    parser.error("unknown command: {}".format(argv[0]))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
