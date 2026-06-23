@@ -44,7 +44,6 @@ cumulative.
 
 ```conf
 skip_public_ip = false
-skip_local_ips = false
 
 [skip]
 203.0.113.10
@@ -53,8 +52,7 @@ skip_local_ips = false
 AS64500
 ```
 
-`skip_public_ip` skips the device's public IP address. `skip_local_ips` skips
-the device's local IP addresses.
+`skip_public_ip` skips the device's public IP address.
 
 For one-off runs, pass `--skip VALUE` with an IP address, CIDR range, or ASN.
 Repeat it to skip multiple values. Pass `--no-skip` to ignore all configured
@@ -70,8 +68,12 @@ Skip rules also apply to lookup-derived output where possible. For example, an
 IP returned by `iptools info` is skipped when its lookup data belongs to a
 skipped ASN, and `iptools condense` omits IP, CIDR, and ASN output discovered
 from skipped Team Cymru lookup results.
-When `condense` prints a summary, skipped IPs are included in the total and
-reported separately.
+Each command prints a summary line after its output, reporting how many items
+were processed and, when skip rules apply, how many were skipped (for example,
+`3 processed, 1 skipped`). The processed count reflects everything the command
+handled, independent of any display limit such as `condense --top`. Pass
+`--short` to omit the summary (and other headers), which is useful when piping
+one command into another.
 Non-short `condense` IP output includes ASN and ASN name details when lookup
 data is available.
 
