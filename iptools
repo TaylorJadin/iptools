@@ -921,17 +921,6 @@ def selected_sections(args):
     return args.ip or show_all, args.asn or show_all, args.cidr or show_all
 
 
-def output_limit(show_all, top, min_count):
-    # type: (bool, Optional[int], int) -> Optional[int]
-    if show_all:
-        return None
-    if top is not None:
-        return top
-    if min_count > 0:
-        return None
-    return 10
-
-
 def print_summary(processed, skipped):
     # type: (int, int) -> None
     parts = ["{} processed".format(processed)]
@@ -956,21 +945,14 @@ def run_condense(argv, config):
         "-n", "--top",
         type=int,
         default=None,
-        help="Show top N entries (default: 10, "
-             "or all when --min-count is used without -n)",
-    )
-    parser.add_argument(
-        "-a", "--all",
-        action="store_true",
-        help="Show all entries (overrides --top)",
+        help="Show only the top N entries (default: show all)",
     )
     parser.add_argument(
         "-m", "--min-count",
         type=int,
         default=0,
         metavar="N",
-        help="Only show entries with at least N IPs "
-             "(implies --all unless -n is also given)",
+        help="Only show entries with at least N IPs",
     )
     parser.add_argument(
         "--asn",
@@ -1017,7 +999,7 @@ def run_condense(argv, config):
     show_ip, show_asn, show_cidr = selected_sections(args)
 
     threshold = args.min_count
-    limit = output_limit(args.all, args.top, threshold)
+    limit = args.top
 
     def filtered(counter):
         items = counter.most_common(None if limit is None else limit)
