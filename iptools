@@ -644,7 +644,7 @@ def run_info(argv, config):
         asns = unique_items(asns)
     if not ips and not asns:
         if found_count and has_skip_rules(rules):
-            print("all IPs and ASNs were skipped")
+            print("all IPs / ASNs were skipped")
             return 0
         parser.error("no IPs or ASNs provided; pass inputs/files/text as arguments or pipe via stdin")
 
@@ -688,7 +688,7 @@ def run_info(argv, config):
             print("error: {}: {}".format(asn, exc), file=sys.stderr)
             exit_code = 1
     if output_count == 0 and lookup_skipped_count > 0 and exit_code == 0:
-        print("all IPs and ASNs were skipped")
+        print("all IPs / ASNs were skipped")
     return exit_code
 
 
