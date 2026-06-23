@@ -16,15 +16,15 @@ Team Cymru WHOIS.
 Run the tool directly from the repo:
 
 ```sh
-./iptools info 8.8.8.8
-./iptools expand 192.0.2.0/30
-./iptools condense 1.1.1.1 8.8.8.8
+./iptools.py info 8.8.8.8
+./iptools.py expand 192.0.2.0/30
+./iptools.py condense 1.1.1.1 8.8.8.8
 ```
 
 Or symlink it into `/usr/local/bin`:
 
 ```sh
-ln -sf "/path/to/repo/iptools" /usr/local/bin/iptools
+ln -sf "/path/to/repo/iptools.py" /usr/local/bin/iptools
 ```
 
 ## Config
