@@ -29,12 +29,18 @@ ln -sf "/path/to/repo/iptools" /usr/local/bin/iptools
 
 ## Config
 
+Create a config file from the example:
+```
+cp iptools.conf.example iptools.conf 
+```
+
 `iptools` loads config from `iptools.conf` next to the real script location,
 `~/.config/iptools/config`, `$IPTOOLS_CONFIG`, and any file passed with
 `--config PATH`. If `iptools` is symlinked into a directory such as
 `/usr/local/bin`, the executable-local config is still read from the symlink
 target directory. Later files override boolean options. Skip entries are
 cumulative.
+
 
 ```conf
 skip_public_ip = false
