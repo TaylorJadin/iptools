@@ -134,6 +134,29 @@ def parse_bool(value):
     return None
 
 
+def strip_inline_comment(line):
+    # type: (str) -> str
+    in_quote = None  # type: Optional[str]
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if in_quote:
+            if char == in_quote:
+                in_quote = None
+            continue
+        if char in ("'", '"'):
+            in_quote = char
+            continue
+        if char in ("#", ";"):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
 def read_config_file(path):
     # type: (str) -> Dict[str, object]
     config = {
@@ -144,8 +167,8 @@ def read_config_file(path):
     section = "options"
     with open(path, "r") as handle:
         for number, raw_line in enumerate(handle, 1):
-            line = raw_line.strip()
-            if not line or line.startswith("#") or line.startswith(";"):
+            line = strip_inline_comment(raw_line).strip()
+            if not line:
                 continue
             if line.startswith("[") and line.endswith("]"):
                 section = line[1:-1].strip().lower()
