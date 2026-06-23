@@ -299,7 +299,11 @@ def network_is_skipped(prefix, rules):
     """A network is skipped when it is contained within a skip network."""
     net = ipaddress.ip_network(prefix, strict=False)
     for skipped in rules.networks:
-        if net.version == skipped.version and net.subnet_of(skipped):
+        if (
+            net.version == skipped.version
+            and net.network_address in skipped
+            and net.broadcast_address in skipped
+        ):
             return True
     return False
 
@@ -551,7 +555,6 @@ def print_info(ip, colors, data=None, bgp_range=None):
 
     print("{}range:{} {}".format(bold, reset, bgp_range))
     print("{}more:{} https://ipinfo.io/{}".format(bold, reset, ip))
-    print("")
 
 
 def print_asn_info(asn, colors):
@@ -583,7 +586,6 @@ def print_asn_info(asn, colors):
         print("{}{}:{} {}".format(bold, key, reset, value))
 
     print("{}more:{} https://ipinfo.io/{}".format(bold, reset, asn))
-    print("")
 
 
 def run_info(argv, config):
@@ -659,6 +661,8 @@ def run_info(argv, config):
             if lookup_info_is_skipped(data, bgp_range, rules):
                 lookup_skipped_count += 1
                 continue
+            if output_count:
+                print("")
             for source in sources_by_ip.get(ip, []):
                 print("{}{} -> {}{}".format(colors["faint"], source, ip, colors["reset"]))
             print_info(ip, colors, data=data, bgp_range=bgp_range)
@@ -668,6 +672,8 @@ def run_info(argv, config):
             exit_code = 1
     for asn in asns:
         try:
+            if output_count:
+                print("")
             print_asn_info(asn, colors)
             output_count += 1
         except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
@@ -921,12 +927,13 @@ def selected_sections(args):
     return args.ip or show_all, args.asn or show_all, args.cidr or show_all
 
 
-def print_summary(processed, skipped):
-    # type: (int, int) -> None
+def print_summary(processed, skipped, leading_blank=True):
+    # type: (int, int, bool) -> None
     parts = ["{} processed".format(processed)]
     if skipped:
         parts.append("{} skipped".format(skipped))
-    print("\n{}".format(", ".join(parts)))
+    prefix = "\n" if leading_blank else ""
+    print("{}{}".format(prefix, ", ".join(parts)))
 
 
 def run_condense(argv, config):
