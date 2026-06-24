@@ -24,7 +24,7 @@ Run the tool directly from the repo:
 Or symlink it into `/usr/local/bin`:
 
 ```sh
-ln -sf "/path/to/repo/iptools.py" /usr/local/bin/iptools
+ln -sf /path/to/repo/iptools.py /usr/local/bin/iptools
 ```
 
 ## Config
