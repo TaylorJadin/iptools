@@ -34,7 +34,11 @@ Create a config file from the example:
 cp iptools.conf.example iptools.conf 
 ```
 
-`iptools` loads config from `iptools.conf` next to the real script location,
+Note that the example config does have some defaults I like set in there, like
+skipping the device's public IP and skipping a list of bogon IPs.
+
+`iptools` loads config from `iptools.conf` next to the real script location
+(so you can leave it right in the repo even if you sylminked the script elsewhere),
 `~/.config/iptools/config`, `$IPTOOLS_CONFIG`, and any file passed with
 `--config PATH`. If `iptools` is symlinked into a directory such as
 `/usr/local/bin`, the executable-local config is still read from the symlink
