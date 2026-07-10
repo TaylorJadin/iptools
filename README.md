@@ -9,7 +9,8 @@ addresses, CIDR ranges, and ASNs from arguments, files, or stdin.
 
 All tools are Python 3 scripts and use only the Python standard library. Network
 lookups use public services including ipinfo.io, RIPEstat, asn.ipinfo.app, and
-Team Cymru WHOIS.
+Team Cymru WHOIS. IP-to-ASN and prefix lookups use Team Cymru first, with
+RIPEstat network-info as an HTTPS fallback when WHOIS is unreachable.
 
 ## Running these scripts 
 
@@ -71,7 +72,7 @@ iptools --no-skip info 203.0.113.10
 Skip rules also apply to lookup-derived output where possible. For example, an
 IP returned by `iptools info` is skipped when its lookup data belongs to a
 skipped ASN, and `iptools condense` omits IP, CIDR, and ASN output discovered
-from skipped Team Cymru lookup results.
+from skipped lookup results.
 Each command prints a summary line after its output, reporting how many items
 were processed and, when skip rules apply, how many were skipped (for example,
 `3 processed, 1 skipped`). The processed count reflects everything the command

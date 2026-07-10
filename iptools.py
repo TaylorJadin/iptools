@@ -46,9 +46,11 @@ RIPESTAT_AS_OVERVIEW_URL = "https://stat.ripe.net/data/as-overview/data.json?res
 RIPESTAT_WHOIS_URL = "https://stat.ripe.net/data/whois/data.json?resource={}"
 ASN_DETAILS_URL = "https://asn.ipinfo.app/api/json/details/{}"
 RIPESTAT_PREFIXES_URL = "https://stat.ripe.net/data/announced-prefixes/data.json?resource={}"
+RIPESTAT_NETWORK_INFO_URL = "https://stat.ripe.net/data/network-info/data.json?resource={}"
 
 Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+LookupResult = Tuple[str, str, str, str, str]
 
 USER_AGENT = "iptools"
 
@@ -327,7 +329,7 @@ def lookup_info_is_skipped(data, bgp_range, rules):
 
 
 def lookup_result_is_skipped(result, rules):
-    # type: (Tuple[str, str, str, str, str], SkipRules) -> bool
+    # type: (LookupResult, SkipRules) -> bool
     _ip, asn, prefix, _cc, _name = result
     if asn_is_skipped(asn, rules):
         return True
@@ -482,7 +484,7 @@ def cymru_query(payload):
     return b"".join(chunks).decode("utf-8", "replace").splitlines()
 
 
-def cymru_lookup(ip):
+def cymru_prefix_lookup(ip):
     # type: (str) -> str
     lines = cymru_query(" -p {}\n".format(ip))
     if len(lines) < 2:
@@ -492,6 +494,80 @@ def cymru_lookup(ip):
     if len(parts) >= 3 and parts[2] != "NA":
         return parts[2]
     return ""
+
+
+def ripestat_network_info(ip):
+    # type: (str) -> Dict
+    """Fetch RIPEstat network-info data for an IP address."""
+    url = RIPESTAT_NETWORK_INFO_URL.format(urllib.parse.quote(ip))
+    return json_lookup(url).get("data", {})
+
+
+def ripestat_prefix_lookup(ip):
+    # type: (str) -> str
+    return str(ripestat_network_info(ip).get("prefix") or "")
+
+
+def bgp_range_lookup(ip):
+    # type: (str) -> str
+    try:
+        return cymru_prefix_lookup(ip)
+    except (socket.timeout, OSError):
+        return ripestat_prefix_lookup(ip)
+
+
+def asn_number(value):
+    # type: (object) -> Optional[str]
+    asn = normalize_asn(str(value))
+    if asn:
+        return asn[2:]
+    return None
+
+
+def asn_field_from_values(values):
+    # type: (object) -> str
+    if not isinstance(values, list):
+        values = [values]
+    numbers = []  # type: List[str]
+    for value in values:
+        number = asn_number(value)
+        if number:
+            numbers.append(number)
+    return " ".join(numbers)
+
+
+def ripestat_as_name(asn, cache):
+    # type: (str, Dict[str, str]) -> str
+    number = asn_number(asn)
+    if number is None:
+        return ""
+    if number not in cache:
+        try:
+            url = RIPESTAT_AS_OVERVIEW_URL.format(urllib.parse.quote("AS{}".format(number)))
+            cache[number] = str(json_lookup(url).get("data", {}).get("holder") or "")
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError):
+            cache[number] = ""
+    return cache[number]
+
+
+def lookup_names(asn_field, cache):
+    # type: (str, Dict[str, str]) -> str
+    names = []  # type: List[str]
+    for number in asn_field.split():
+        name = ripestat_as_name(number, cache)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names)
+
+
+def ripestat_lookup(ip, name_cache):
+    # type: (str, Dict[str, str]) -> Optional[LookupResult]
+    data = ripestat_network_info(ip)
+    prefix = str(data.get("prefix") or "")
+    asn = asn_field_from_values(data.get("asns") or [])
+    if not prefix or not asn:
+        return None
+    return ip, asn, prefix, "", lookup_names(asn, name_cache)
 
 
 def format_asn_field(asn):
@@ -544,7 +620,7 @@ def print_info(ip, colors, data=None, bgp_range=None):
     if data is None:
         data = ipinfo_lookup(ip)
     if bgp_range is None:
-        bgp_range = cymru_lookup(ip)
+        bgp_range = bgp_range_lookup(ip)
     for key in sorted(data.keys()):
         value = data[key]
         # ipinfo.io free responses include a "readme" pointer to
@@ -657,7 +733,7 @@ def run_info(argv, config):
     for ip in ips:
         try:
             data = ipinfo_lookup(ip)
-            bgp_range = cymru_lookup(ip)
+            bgp_range = bgp_range_lookup(ip)
             if lookup_info_is_skipped(data, bgp_range, rules):
                 lookup_skipped_count += 1
                 continue
@@ -903,13 +979,13 @@ def collect_condense_inputs(inputs):
     return ips
 
 
-def lookup_bulk(ips):
-    # type: (List[str]) -> List[Tuple[str, str, str, str, str]]
+def cymru_lookup_bulk(ips):
+    # type: (List[str]) -> List[LookupResult]
     """Query Team Cymru bulk WHOIS."""
     query = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
     lines = cymru_query(query)
 
-    results = []  # type: List[Tuple[str, str, str, str, str]]
+    results = []  # type: List[LookupResult]
     for line in lines[1:]:
         parts = [p.strip() for p in line.split("|")]
         if len(parts) >= 7:
@@ -918,6 +994,25 @@ def lookup_bulk(ips):
                 continue
             results.append((_ip, asn, prefix, cc, name))
     return results
+
+
+def ripestat_lookup_bulk(ips):
+    # type: (List[str]) -> List[LookupResult]
+    name_cache = {}  # type: Dict[str, str]
+    results_by_ip = {}  # type: Dict[str, LookupResult]
+    for ip in unique_items(ips):
+        result = ripestat_lookup(ip, name_cache)
+        if result:
+            results_by_ip[ip] = result
+    return [results_by_ip[ip] for ip in ips if ip in results_by_ip]
+
+
+def lookup_bulk(ips):
+    # type: (List[str]) -> List[LookupResult]
+    try:
+        return cymru_lookup_bulk(ips)
+    except (socket.timeout, OSError):
+        return ripestat_lookup_bulk(ips)
 
 
 def selected_sections(args):
@@ -1014,18 +1109,22 @@ def run_condense(argv, config):
             items = [(k, c) for k, c in items if c >= threshold]
         return items
 
-    results = []  # type: List[Tuple[str, str, str, str, str]]
+    results = []  # type: List[LookupResult]
     lookup_skipped_count = 0
     needs_lookup = show_asn or show_cidr or (show_ip and (not args.short or rules.has_lookup_rules()))
     if needs_lookup:
         try:
             lookup_results = lookup_bulk(ips)
-        except (socket.timeout, OSError) as exc:
+        except (socket.timeout, OSError, urllib.error.URLError, ValueError) as exc:
             print("error: lookup: {}".format(exc), file=sys.stderr)
             return 1
-        results = [r for r in lookup_results if not lookup_result_is_skipped(r, rules)]
+        skipped_lookup_ips = set()  # type: Set[str]
+        for result in lookup_results:
+            if lookup_result_is_skipped(result, rules):
+                skipped_lookup_ips.add(result[0])
+                continue
+            results.append(result)
         lookup_skipped_count = len(lookup_results) - len(results)
-        skipped_lookup_ips = set(r[0] for r in lookup_results if lookup_result_is_skipped(r, rules))
         if skipped_lookup_ips:
             before_lookup_skip_count = len(ips)
             ips = [ip for ip in ips if ip not in skipped_lookup_ips]
